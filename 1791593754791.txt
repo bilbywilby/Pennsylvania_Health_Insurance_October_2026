@@ -1,0 +1,529 @@
+
+--------------------------------------------------------\nadd_rc_block() {\n    [ \"$NO_RC\" -eq 1 ] && { log_info \"Skipping rc edits (--no-rc)\"; return 0; }\n    for _rc in \"$HOME/.bashrc\" \"$HOME/.profile\"; do\n        [ -f \"$_rc\" ] || continue\n        if grep -qF \"$RC_MARK_START\" \"$_rc\" 2>/dev/null; then\n            log_info \"PATH block already present in $_rc\"\n            continue\n        fi\n        if [ \"$DRY_RUN\" -eq 1 ]; then\n            printf '[dry-run] append PATH block to %s\\n' \"$_rc\"\n            continue\n        fi\n        {\n            printf '\\n%s\\n' \"$RC_MARK_START\"\n            printf 'export MASTER_STORAGE=\"%s\"\\n' \"$MASTER_STORAGE\"\n            printf 'case \":$PATH:\" in *\":%s:\"*) ;; *) export PATH=\"%s:$PATH\" ;; esac\\n' \"$PREFIX\" \"$PREFIX\"\n            printf '%s\\n' \"$RC_MARK_END\"\n        } >> \"$_rc\"\n        log_info \"Appended PATH block to $_rc\"\n    done\n}\n\nremove_rc_block() {\n    for _rc in \"$HOME/.bashrc\" \"$HOME/.profile\"; do\n        [ -f \"$_rc\" ] || continue\n        grep -qF \"$RC_MARK_START\" \"$_rc\" 2>/dev/null || continue\n        if [ \"$DRY_RUN\" -eq 1 ]; then\n            printf '[dry-run] remove PATH block from %s\\n' \"$_rc\"\n            continue\n        fi\n        _tmp=\"$_rc.tmp.$$\"\n        awk -v start=\"$RC_MARK_START\" -v end=\"$RC_MARK_END\" '\n            $0 == start { skip=1; next }\n            $0 == end   { skip=0; next }\n            !skip { print }\n        ' \"$_rc\" > \"$_tmp\"\n        mv \"$_tmp\" \"$_rc\"\n        log_info \"Removed PATH block from $_rc\"\n    done\n}\n\n# ---------------------------------------------------------------------------\n# Uninstall path\n# ---------------------------------------------------------------------------\ndo_uninstall() {\n    remove_launcher\n    remove_rc_block\n    if [ \"$PURGE_DATA\" -eq 1 ]; then\n        if [ \"$DRY_RUN\" -eq 1 ]; then\n            printf '[dry-run] rm -rf %s\\n' \"$MASTER_STORAGE\"\n        else\n            rm -rf \"$MASTER_STORAGE\"\n            log_info \"Purged $MASTER_STORAGE\"\n        fi\n    else\n        log_info \"Data preserved at $MASTER_STORAGE (use --purge-data to remove)\"\n    fi\n    log_info \"Uninstall complete.\"\n    exit \"$EXIT_OK\"\n}\n\n# ---------------------------------------------------------------------------\n# Main\n# ---------------------------------------------------------------------------\nif [ \"$UNINSTALL\" -eq 1 ]; then\n    do_uninstall\nfi\n\nlog_info \"Installing Termux Master Ultra\"\nlog_info \"  MASTER_STORAGE = $MASTER_STORAGE\"\nlog_info \"  PREFIX         = $PREFIX\"\n[ \"$DRY_RUN\" -eq 1 ] && log_info \"  Mode           = dry-run (no changes will be made)\"\n\ncheck_dependencies\nensure_storage_layout\ninstall_app_files\nsetup_venv\ninstall_launcher\nadd_rc_block\n\nlog_info \"Install complete.\"\nlog_info \"Run 'master setup' to finish initializing, or restart your shell to pick up PATH changes.\"\nexit \"$EXIT_OK\"\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:551:      "content": "#!/usr/bin/env bash\nset -e\nmkdir -p addons\n\ncat << 'EOF' > addons/1_webhook.py\nimport http.server, socketserver, subprocess\nlocal_port = 8080\nclass H(http.server.SimpleHTTPRequestHandler):\n    def do_POST(self):\n        subprocess.Popen([\"sh\", \"./master.sh\"])\n        self.send_response(200)\n        self.end_headers()\nsocketserver.TCPServer((\"\", local_port), H).serve_forever()\nEOF\n\n# Fixed: termux-job-scheduler doesn't exist outside Termux. Detects the\n# environment and uses cron on Debian/AVF, falls back to Termux's native\n# scheduler when actually running inside Termux.\ncat << 'EOF' > addons/2_scheduler.sh\n#!/usr/bin/env bash\nset -e\nPERIOD_MS=\"${1:-86400000}\"\nPERIOD_MIN=$(( PERIOD_MS / 60000 ))\n[ \"$PERIOD_MIN\" -lt 1 ] && PERIOD_MIN=1\n\nif command -v termux-job-scheduler >/dev/null 2>&1; then\n    termux-job-scheduler --script \"$PWD/master.sh\" --period-ms \"$PERIOD_MS\"\n    exit 0\nfi\n\nif command -v crontab >/dev/null 2>&1; then\n    CRON_LINE=\"*/${PERIOD_MIN} * * * * cd $PWD && ./master.sh >> $PWD/addons/scheduler.log 2>&1\"\n    ( crontab -l 2>/dev/null | grep -vF \"$PWD/master.sh\" ; echo \"$CRON_LINE\" ) | crontab -\n    echo \"Registered cron job: every ${PERIOD_MIN} min via crontab\"\n    exit 0\nfi\n\necho \"error: neither termux-job-scheduler nor crontab found\" >&2\nexit 1\nEOF\n\n# Fixed: termux-battery-status doesn't exist outside Termux. Falls back to\n# /sys/class/power_supply on plain Linux; skips the gate (exit 0, don't\n# block the pipeline) if no battery source can be found at all, since an\n# AVF VM may have no exposed battery telemetry.\ncat << 'EOF' > addons/3_resource_gate.sh\n#!/usr/bin/env bash\nset -e\nMIN_BATTERY=\"${1:-20}\"\n\nget_battery_pct() {\n    if command -v termux-battery-status >/dev/null 2>&1; then\n        termux-battery-status | grep -oP '(?<=\"percentage\": )\\d+'\n        return\n    fi\n    for supply in /sys/class/power_supply/*/capacity; do\n        [ -f \"$supply\" ] && cat \"$supply\" && return\n    done\n    echo \"\"\n}\n\nbattery_pct=$(get_battery_pct)\n\nif [ -z \"$battery_pct\" ]; then\n    echo \"warn: no battery source found, skipping gate\" >&2\n    exit 0\nfi\n\n[ \"$battery_pct\" -lt \"$MIN_BATTERY\" ] && exit 1 || exit 0\nEOF\n\ncat << 'EOF' > addons/4_archiver.sh\n#!/usr/bin/env bash\nset -e\nsqlite3 ~/.termux_master/state.db \".dump\" | gzip > addons/state_backup_$(date +%s).sql.gz\nEOF\n\n# Fixed: falls back to pkg install -y with no error handling when pkg\n# doesn't exist. Detects pkg vs apt-get vs apt and uses whichever is\n# actually present.\ncat << 'EOF' > addons/5_dep_injector.sh\n#!/usr/bin/env bash\nset -e\nBIN=\"$1\"\n[ -z \"$BIN\" ] && { echo \"usage: $0 <binary>\" >&2; exit 1; }\n\ncommand -v \"$BIN\" >/dev/null 2>&1 && exit 0\n\nif command -v pkg >/dev/null 2>&1; then\n    pkg install -y \"$BIN\"\nelif command -v apt-get >/dev/null 2>&1; then\n    sudo apt-get update -y && sudo apt-get install -y \"$BIN\"\nelif command -v apt >/dev/null 2>&1; then\n    sudo apt install -y \"$BIN\"\nelse\n    echo \"error: no supported package manager found (pkg/apt-get/apt)\" >&2\n    exit 1\nfi\nEOF\n\ncat << 'EOF' > addons/6_telemetry.sh\n#!/usr/bin/env bash\nset -e\ncurl -X POST -H \"Content-Type: application/json\" -d \"{\\\"content\\\":\\\"$1\\\"}\" \"$WEBHOOK_URL\"\nEOF\n\ncat << 'EOF' > addons/7_tui_dashboard.py\nimport curses, sqlite3\ndef main(stdscr):\n    stdscr.addstr(0, 0, \"DAG State Monitor - Active\")\n    stdscr.refresh()\n    stdscr.getkey()\ncurses.wrapper(main)\nEOF\n\ncat << 'EOF' > addons/8_log_rotator.sh\n#!/usr/bin/env bash\nset -e\nfind ~/.termux_master/logs/ -type f -mtime +7 -exec gzip {} \\;\nEOF\n\ncat << 'EOF' > addons/9_network_presence.sh\n#!/usr/bin/env bash\nset -e\nip neigh show | grep -q \"$1\" && exit 0 || exit 1\nEOF\n\n# NOTE: StrictHostKeyChecking=no is kept per the original spec (must_have:\n# \"strict host key checking disabled\"). This means an attacker who can\n# intercept this connection (rogue AP, ARP spoofing on the same LAN) can\n# swap the host key silently, with no warning shown. Fine for a trusted\n# LAN-only router with a known static IP; risky on anything else. Swap in\n# a pinned known_hosts entry instead of \"no\" if that risk isn't acceptable.\ncat << 'EOF' > addons/10_wg_rotator.sh\n#!/usr/bin/env bash\nset -e\nssh -o StrictHostKeyChecking=no root@${2:-192.168.1.1} \"/etc/init.d/network restart ${1:-wg0}\"\nEOF\n\nchmod +x addons/*.sh addons/*.py\necho \"Installed 10 addons into ./addons/ (2, 3, 5 refactored for Debian/AVF compatibility)\"\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:560:      "content": "#!/bin/bash\n# Global Utilities for Pixel Terminal\n\nshutdown_gracefully() {\n    echo \"[!] Initiating graceful shutdown sequence...\"\n    # Kill background monitors\n    if [ -n \"${IDLE_MONITOR_PID:-}\" ]; then\n        kill \"$IDLE_MONITOR_PID\" 2>/dev/null || true\n    fi\n    echo \"[+] Resource gates released. System offline.\"\n    exit 0\n}\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:578:      "content": "#!/bin/bash\n# OPSEC: Idle state detector for terminal sessions\n# Usage: source idle_monitor.sh <timeout_minutes>\n\nIDLE_TIMEOUT_MIN=${1:-60}  # Default: 5 minutes\nIDLE_FILE=\"/tmp/pixel_terminal_idle_$$\"\nLAST_ACTIVITY_FILE=\"/tmp/pixel_terminal_last_activity_$$\"\n\n# Initialize activity timestamp\ndate +%s > \"$LAST_ACTIVITY_FILE\"\n\n# Update activity on any input\ntrap 'date +%s > \"$LAST_ACTIVITY_FILE\"' DEBUG\n\n# Idle check loop\nidle_monitor_loop() {\n    while true; do\n        sleep 10\n        local last_activity=$(cat \"$LAST_ACTIVITY_FILE\" 2>/dev/null || echo 0)\n        local current_time=$(date +%s)\n        local idle_duration=$((current_time - last_activity))\n\n        if [ \"$idle_duration\" -ge $((IDLE_TIMEOUT_MIN * 60)) ]; then\n            echo \"[!] Idle detected: $IDLE_TIMEOUT_MIN minutes of inactivity\" >&2\n            touch \"$IDLE_FILE\"\n            # Trigger graceful shutdown via master.sh\n            if [ -f \"$HOME/pixel-terminal-master/master.sh\" ]; then\n                bash -c \"source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully\"\n            fi\n            break\n        fi\n    done\n}\n\n# Start the monitor in background\nidle_monitor_loop &\nIDLE_MONITOR_PID=$!\nexport IDLE_MONITOR_PID\n\n# Cleanup on exit\ncleanup_idle_monitor() {\n    kill \"$IDLE_MONITOR_PID\" 2>/dev/null || true\n    rm -f \"$IDLE_FILE\" \"$LAST_ACTIVITY_FILE\"\n}\ntrap cleanup_idle_monitor EXIT\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:587:      "content": "#!/bin/bash\n# Usage: timeout_wrapper.sh <seconds> <command>\nTIMEOUT=$1\nshift\nCMD=\"$@\"\nif ! command -v timeout &> /dev/null; then\n    echo \"[-] Error: 'timeout' utility not found.\"\n    exit 1\nfi\ntimeout \"$TIMEOUT\" bash -c \"$CMD\"\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:596:      "content": "#!/bin/bash\n# Enhanced Resource Gate v2.0 - OPSEC Sanitized\nMIN_BATTERY=20\nMAX_LOAD=2.0\n\nbattery_pct=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null || echo 100)\nif [ \"$battery_pct\" -lt \"$MIN_BATTERY\" ]; then\n    echo \"[-] Gate Closed: Battery too low ($battery_pct%)\"\n    exit 1\nfi\n\nload_avg=$(uptime | awk -F'load average:' '{ print $2 }' | cut -d, -f1 | xargs)\nif (( $(echo \"$load_avg > $MAX_LOAD\" | bc -l) )); then\n    echo \"[-] Gate Closed: CPU Load too high ($load_avg)\"\n    exit 1\nfi\necho \"[+] Resource Gate Passed.\"\nexit 0\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:645:          "./install_addons.sh:125:ip neigh show | grep -q \"$1\" && exit 0 || exit 1",
+/home/droid/pixel-terminal-master/HANDOVER.json:673:          "./addons/9_network_presence.sh:3:ip neigh show | grep -q \"$1\" && exit 0 || exit 1"
+/home/droid/pixel-terminal-master/HANDOVER.json:705:          "./install_addons.sh:125:ip neigh show | grep -q \"$1\" && exit 0 || exit 1",
+/home/droid/pixel-terminal-master/HANDOVER.json:732:          "./addons/9_network_presence.sh:3:ip neigh show | grep -q \"$1\" && exit 0 || exit 1"
+/home/droid/pixel-terminal-master/HANDOVER.json:766:      "# Cleanup on exit",
+/home/droid/pixel-terminal-master/addons/2_scheduler.sh:9:    exit 0
+/home/droid/pixel-terminal-master/addons/2_scheduler.sh:16:    exit 0
+/home/droid/pixel-terminal-master/addons/2_scheduler.sh:20:exit 1
+/home/droid/pixel-terminal-master/addons/5_dep_injector.sh:4:[ -z "$BIN" ] && { echo "usage: $0 <binary>" >&2; exit 1; }
+/home/droid/pixel-terminal-master/addons/5_dep_injector.sh:6:command -v "$BIN" >/dev/null 2>&1 && exit 0
+/home/droid/pixel-terminal-master/addons/5_dep_injector.sh:16:    exit 1
+/home/droid/pixel-terminal-master/addons/9_network_presence.sh:3:ip neigh show | grep -q "$1" && exit 0 || exit 1
+/home/droid/pixel-terminal-master/addons/3_resource_gate.sh:9:    exit 1
+/home/droid/pixel-terminal-master/addons/3_resource_gate.sh:15:    exit 1
+/home/droid/pixel-terminal-master/addons/3_resource_gate.sh:18:exit 0
+
+--- Searching for: size ---
+/home/droid/pixel-terminal-master/Vid2gif/fix_repo.sh:48:output** - File sizes in KB/MB/GB - 
+/home/droid/pixel-terminal-master/Vid2gif/vid2gif.sh:137:calc_size() {
+/home/droid/pixel-terminal-master/Vid2gif/vid2gif.sh:252:    log_info "Input:  $INPUT ($(calc_size "$INPUT"))"
+/home/droid/pixel-terminal-master/Vid2gif/vid2gif.sh:267:    log_info "Output: $OUTPUT ($(calc_size "$OUTPUT"))"
+/home/droid/pixel-terminal-master/project.json:107:    "size_estimated": "minimal (<1MB per 10k runs)"
+
+--- Searching for: limit ---
+grep: /home/droid/pixel-terminal-master/__pycache__/state.cpython-313.pyc: binary file matches
+grep: /home/droid/pixel-terminal-master/__pycache__/dashboard.cpython-313.pyc: binary file matches
+/home/droid/pixel-terminal-master/LICENSE:7:in the Software without restriction, including without limitation the rights
+/home/droid/pixel-terminal-master/Vid2gif/LICENSE:7:in the Software without restriction, including without limitation the rights
+/home/droid/pixel-terminal-master/state.py:47:def list_runs(limit=5):
+/home/droid/pixel-terminal-master/state.py:51:    cur.execute("SELECT run_id, dag_id, status, start_time, end_time, error_message FROM runs ORDER BY run_id DESC LIMIT ?", (limit,))
+/home/droid/pixel-terminal-master/state.py:76:        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+/home/droid/pixel-terminal-master/state.py:77:        list_runs(limit)
+/home/droid/pixel-terminal-master/.git/hooks/fsmonitor-watchman.sample:86:     # recency index to select candidate nodes and "fields" to limit the
+/home/droid/pixel-terminal-master/dashboard.py:116:    return jsonify(state.list_runs(limit=50, dag=dag_id))
+/home/droid/pixel-terminal-master/HANDOVER.json:376:      "stderr": "/home/droid/pixel-terminal-master/Vid2gif/fix_repo.sh: line 97: warning: here-document at line 17 delimited by end-of-file (wanted `CHANGELOGEOF')"
+
+--- Searching for: inactive ---
+No matches found.
+
+--- Searching for: kill ---
+/home/droid/pixel-terminal-master/.git/logs/refs/heads/main:11:f7b6bf450c1867db2e2545feda4ddc0b60d051fc e129a385bdb0d7272549a7030bcb12248656420f Carter the Duck <carter@duck.ai> 1791067570 +0000    commit: Fix: removed hardcoded kill, disabled idle monitor trap chaining
+/home/droid/pixel-terminal-master/.git/logs/HEAD:11:f7b6bf450c1867db2e2545feda4ddc0b60d051fc e129a385bdb0d7272549a7030bcb12248656420f Carter the Duck <carter@duck.ai> 1791067570 +0000       commit: Fix: removed hardcoded kill, disabled idle monitor trap chaining
+/home/droid/pixel-terminal-master/master.sh.bak:79:            # kill the script on a nonzero exit before we can record it.
+/home/droid/pixel-terminal-master/master.sh:79:            # kill the script on a nonzero exit before we can record it.
+/home/droid/pixel-terminal-master/lib/monitor.sh:23:        if kill -0 "$_old_pid" 2>/dev/null; then
+/home/droid/pixel-terminal-master/lib/monitor.sh:55:        if kill "$_pid" 2>/dev/null; then
+/home/droid/pixel-terminal-master/lib/monitor.sh:67:    if [ -f "$_pid_file" ] && kill -0 "$(cat "$_pid_file")" 2>/dev/null; then
+/home/droid/pixel-terminal-master/lib/common.sh:8:        kill "$IDLE_MONITOR_PID" 2>/dev/null || true
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:42:    kill "$IDLE_MONITOR_PID" 2>/dev/null || true
+/home/droid/pixel-terminal-master/HANDOVER.json:31:      "e129a38 | 2026-10-03T22:46:10Z | Carter the Duck | Fix: removed hardcoded kill, disabled idle monitor trap chaining",
+/home/droid/pixel-terminal-master/HANDOVER.json:533:      "content": "#!/bin/sh\n# Termux Master Scripts Main CLI Core\nset -eu\nMASTER_STORAGE=\"${MASTER_STORAGE:-$HOME/.termux_master}\"\nexport MASTER_STORAGE\n\n# Load Libraries\n. \"$MASTER_STORAGE/lib/common.sh\"\n. \"$MASTER_STORAGE/lib/crypto.sh\"\n. \"$MASTER_STORAGE/lib/scheduler.sh\"\n. \"$MASTER_STORAGE/lib/dto.sh\"\n. \"$MASTER_STORAGE/lib/config.sh\"\n. \"$MASTER_STORAGE/lib/termux_api.sh\"\n. \"$MASTER_STORAGE/lib/monitor.sh\"\n. \"$MASTER_STORAGE/lib/adb.sh\"\n. \"$MASTER_STORAGE/lib/plugin.sh\"\n\nensure_directories\nload_plugins\n\nVERSION=\"0.2.0\"\n\nusage() {\n    cat << EOF\nTermux Master CLI Engine v${VERSION}\n\nUsage: master.sh <command> [options]\nCommands:\n  setup                              Initialize storage & structure\n  version                            Print version\n  import <file.json>                 Import a Script DTO\n  run <script_id>                    Execute an imported script DTO\n  list                                List imported DAG script IDs\n  env set <key> <val> [1|0]          Set environment variable (1=encrypt)\n  schedule add <id> <cron> <script>  Schedule execution\n  backup create [out.tar.gz]         Snapshot framework state\n  config get|set <key> [val]         Read/write config.ini\n  monitor start|stop|status <id>     Manage watchdog supervisors\n  adb set|run|list <code> [script]   ADB intent code mapping\n  plugins list                       List loaded plugins\nEOF\n    exit 0\n}\n\nmain() {\n    [ $# -eq 0 ] && usage\n    _cmd=\"$1\"; shift\n\n    case \"$_cmd\" in\n        setup)\n            ensure_directories\n            log_info \"System configuration active at $MASTER_STORAGE\"\n            ;;\n        version)\n            printf 'termux-master-ultra %s\\n' \"$VERSION\"\n            ;;\n        import)\n            [ $# -lt 1 ] && { log_err \"Import requires JSON DTO path\"; exit 1; }\n            import_script_dto \"$1\"\n            ;;\n        run)\n            [ $# -lt 1 ] && { log_err \"Run command requires script ID\"; exit 1; }\n            _dag_id=\"$1\"\n            _script_target=\"$MASTER_STORAGE/scripts/${_dag_id}.json\"\n            if [ ! -f \"$_script_target\" ]; then\n                log_err \"Script ID '$_dag_id' not found.\"\n                exit 1\n            fi\n            _exec_cmd=$(jq -r '.command' \"$_script_target\")\n\n            _exec_id=\"$(date -u +%Y%m%dT%H%M%SZ)-$$\"\n            _log_path=\"$MASTER_STORAGE/logs/${_dag_id}_${_exec_id}.log\"\n\n            _run_id=$(python3 \"$MASTER_STORAGE/bin/state.py\" record-start \"$_dag_id\")\n            log_info \"Executing '$_dag_id' (run_id=$_run_id): $_exec_cmd\"\n            log_info \"Output log: $_log_path\"\n\n            # Guarded with if/else, not a bare command, so `set -e` doesn't\n            # kill the script on a nonzero exit before we can record it.\n            # Wrapped in a subshell ( ) so that if _exec_cmd itself contains\n            # a literal `exit N`, it only terminates the subshell — not this\n            # master.sh process, which would otherwise skip every line below.\n            if ( eval \"$_exec_cmd\" ) > \"$_log_path\" 2>&1; then\n                _exit_code=0\n                _status=\"success\"\n            else\n                _exit_code=$?\n                _status=\"failed\"\n            fi\n\n            if [ \"$_status\" = \"success\" ]; then\n                python3 \"$MASTER_STORAGE/bin/state.py\" record-finish \"$_run_id\" success\n            else\n                python3 \"$MASTER_STORAGE/bin/state.py\" record-finish \"$_run_id\" failed \"exit code $_exit_code\"\n            fi\n\n            log_info \"Run '$_dag_id' finished: status=$_status exit_code=$_exit_code\"\n            # Surface the captured output to the caller — CLI users still see\n            # it, dashboard-triggered runs (stdout/stderr sent to DEVNULL by\n            # the caller) just lose the live echo but keep the log file.\n            cat \"$_log_path\"\n            exit \"$_exit_code\"\n            ;;\n        list)\n            if [ -d \"$MASTER_STORAGE/scripts\" ]; then\n                for _f in \"$MASTER_STORAGE\"/scripts/*.json; do\n                    [ -f \"$_f\" ] || continue\n                    basename \"$_f\" .json\n                done\n            fi\n            ;;\n        env)\n            _subcmd=\"${1:-}\"\n            if [ \"$_subcmd\" = \"set\" ]; then\n                _key=\"$2\"\n                _val=\"$3\"\n                _encrypt=\"${4:-0}\"\n                if [ \"$_encrypt\" = \"1\" ]; then\n                    _val=$(encrypt_value \"$_val\")\n                    printf '%s=ENC:%s\\n' \"$_key\" \"$_val\" >> \"$MASTER_STORAGE/envs/global.env\"\n                else\n                    printf '%s=%s\\n' \"$_key\" \"$_val\" >> \"$MASTER_STORAGE/envs/global.env\"\n                fi\n                chmod 600 \"$MASTER_STORAGE/envs/global.env\"\n            fi\n            ;;\n        schedule)\n            _subcmd=\"${1:-}\"\n            if [ \"$_subcmd\" = \"add\" ]; then\n                _job_id=\"$2\"\n                _cron=\"$3\"\n                _script_id=\"$4\"\n                schedule_job \"$_job_id\" \"$_cron\" \"$MASTER_STORAGE/scripts/${_script_id}.json\"\n            fi\n            ;;\n        backup)\n            _out=\"${1:-$HOME/master-backup-$(date +%s).tar.gz}\"\n            tar -czf \"$_out\" -C \"$MASTER_STORAGE\" . --exclude=\"./.env_key\"\n            log_info \"Backup archive created at $_out\"\n            ;;\n        config)\n            _subcmd=\"${1:-}\"; shift\n            if [ \"$_subcmd\" = \"get\" ]; then\n                config_get \"$1\"\n                echo \"\"\n            elif [ \"$_subcmd\" = \"set\" ]; then\n                config_set \"$1\" \"$2\"\n                log_info \"Config updated: $1=$2\"\n            fi\n            ;;\n        monitor)\n            _subcmd=\"${1:-}\"; shift\n            case \"$_subcmd\" in\n                start) monitor_start \"$1\" \"${2:-5}\" ;;\n                stop) monitor_stop \"$1\" ;;\n                status) monitor_status \"$1\" ;;\n                *) log_err \"Unknown monitor subcommand: $_subcmd\" ;;\n            esac\n            ;;\n        adb)\n            _subcmd=\"${1:-}\"; shift\n            case \"$_subcmd\" in\n                set) adb_set_mapping \"$1\" \"$2\" ;;\n                run) adb_dispatch \"$1\" ;;\n                list) adb_list ;;\n                *) log_err \"Unknown adb subcommand: $_subcmd\" ;;\n            esac\n            ;;\n        plugins)\n            _subcmd=\"${1:-list}\"\n            if [ \"$_subcmd\" = \"list\" ]; then\n                list_plugins\n            fi\n            ;;\n        *)\n            usage\n            ;;\n    esac\n}\n\nmain \"$@\"\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:560:      "content": "#!/bin/bash\n# Global Utilities for Pixel Terminal\n\nshutdown_gracefully() {\n    echo \"[!] Initiating graceful shutdown sequence...\"\n    # Kill background monitors\n    if [ -n \"${IDLE_MONITOR_PID:-}\" ]; then\n        kill \"$IDLE_MONITOR_PID\" 2>/dev/null || true\n    fi\n    echo \"[+] Resource gates released. System offline.\"\n    exit 0\n}\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:569:      "content": "#!/bin/sh\n# Process Supervisor & Watchdog Daemon\nset -eu\n\nMONITOR_DIR=\"$MASTER_STORAGE/schedules/monitors\"\n\nensure_monitor_dir() {\n    if [ ! -d \"$MONITOR_DIR\" ]; then\n        mkdir -p \"$MONITOR_DIR\"\n        chmod 700 \"$MONITOR_DIR\"\n    fi\n}\n\nmonitor_start() {\n    _script_id=\"$1\"\n    _max_retries=\"${2:-5}\"\n    ensure_monitor_dir\n    _pid_file=\"$MONITOR_DIR/${_script_id}.pid\"\n    _log_file=\"$MONITOR_DIR/${_script_id}.log\"\n\n    if [ -f \"$_pid_file\" ]; then\n        _old_pid=$(cat \"$_pid_file\")\n        if kill -0 \"$_old_pid\" 2>/dev/null; then\n            log_warn \"Monitor process already active for ID '$_script_id' (PID: $_old_pid)\"\n            return 0\n        fi\n    fi\n\n    log_info \"Starting watchdog process for script: $_script_id\"\n    nohup sh -c \"\n        retry_count=0\n        while [ \\$retry_count -lt $_max_retries ]; do\n            log_info 'Watchdog spawning execution of $_script_id'\n            if master.sh run '$_script_id' >> '$_log_file' 2>&1; then\n                retry_count=0\n            else\n                retry_count=\\$((retry_count + 1))\n                log_err 'Script $_script_id failed. Retrying (\\${retry_count}/$_max_retries)...'\n                sleep \\$((retry_count * 5))\n            fi\n        done\n        log_err 'Max retries reached for $_script_id. Terminating supervisor.'\n        rm -f '$_pid_file'\n    \" >/dev/null 2>&1 &\n    _new_pid=$!\n    printf '%s' \"$_new_pid\" > \"$_pid_file\"\n    log_info \"Supervisor running for '$_script_id' under PID: $_new_pid\"\n}\n\nmonitor_stop() {\n    _script_id=\"$1\"\n    _pid_file=\"$MONITOR_DIR/${_script_id}.pid\"\n    if [ -f \"$_pid_file\" ]; then\n        _pid=$(cat \"$_pid_file\")\n        if kill \"$_pid\" 2>/dev/null; then\n            log_info \"Terminated supervisor process PID: $_pid\"\n        fi\n        rm -f \"$_pid_file\"\n    else\n        log_warn \"No active supervisor found for ID: $_script_id\"\n    fi\n}\n\nmonitor_status() {\n    _script_id=\"$1\"\n    _pid_file=\"$MONITOR_DIR/${_script_id}.pid\"\n    if [ -f \"$_pid_file\" ] && kill -0 \"$(cat \"$_pid_file\")\" 2>/dev/null; then\n        printf 'RUNNING (PID: %s)\\n' \"$(cat \"$_pid_file\")\"\n    else\n        printf 'STOPPED\\n'\n    fi\n}\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:578:      "content": "#!/bin/bash\n# OPSEC: Idle state detector for terminal sessions\n# Usage: source idle_monitor.sh <timeout_minutes>\n\nIDLE_TIMEOUT_MIN=${1:-60}  # Default: 5 minutes\nIDLE_FILE=\"/tmp/pixel_terminal_idle_$$\"\nLAST_ACTIVITY_FILE=\"/tmp/pixel_terminal_last_activity_$$\"\n\n# Initialize activity timestamp\ndate +%s > \"$LAST_ACTIVITY_FILE\"\n\n# Update activity on any input\ntrap 'date +%s > \"$LAST_ACTIVITY_FILE\"' DEBUG\n\n# Idle check loop\nidle_monitor_loop() {\n    while true; do\n        sleep 10\n        local last_activity=$(cat \"$LAST_ACTIVITY_FILE\" 2>/dev/null || echo 0)\n        local current_time=$(date +%s)\n        local idle_duration=$((current_time - last_activity))\n\n        if [ \"$idle_duration\" -ge $((IDLE_TIMEOUT_MIN * 60)) ]; then\n            echo \"[!] Idle detected: $IDLE_TIMEOUT_MIN minutes of inactivity\" >&2\n            touch \"$IDLE_FILE\"\n            # Trigger graceful shutdown via master.sh\n            if [ -f \"$HOME/pixel-terminal-master/master.sh\" ]; then\n                bash -c \"source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully\"\n            fi\n            break\n        fi\n    done\n}\n\n# Start the monitor in background\nidle_monitor_loop &\nIDLE_MONITOR_PID=$!\nexport IDLE_MONITOR_PID\n\n# Cleanup on exit\ncleanup_idle_monitor() {\n    kill \"$IDLE_MONITOR_PID\" 2>/dev/null || true\n    rm -f \"$IDLE_FILE\" \"$LAST_ACTIVITY_FILE\"\n}\ntrap cleanup_idle_monitor EXIT\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:601:      "kill -9 [0-9]": {
+/home/droid/pixel-terminal-master/HANDOVER.json:605:      "kill -[0-9] [0-9]": {
+/home/droid/pixel-terminal-master/HANDOVER.json:749:      "pkill ": {
+/home/droid/pixel-terminal-master/HANDOVER.json:755:      "command": "grep -RInE 'kill -9 [0-9]+' --exclude-dir=.git .",
+/home/droid/pixel-terminal-master/HANDOVER.json:764:      "    kill \"$IDLE_MONITOR_PID\" 2>/dev/null || true",
+/home/droid/pixel-terminal-master/HANDOVER.json:797:      "No hardcoded numeric PID matched the audited kill -9 pattern",
+
+--- Searching for: shutdown ---
+/home/droid/pixel-terminal-master/lib/common.sh:4:shutdown_gracefully() {
+/home/droid/pixel-terminal-master/lib/common.sh:5:    echo "[!] Initiating graceful shutdown sequence..."
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:26:            # Trigger graceful shutdown via master.sh
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:28:                bash -c "source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully"
+/home/droid/pixel-terminal-master/HANDOVER.json:560:      "content": "#!/bin/bash\n# Global Utilities for Pixel Terminal\n\nshutdown_gracefully() {\n    echo \"[!] Initiating graceful shutdown sequence...\"\n    # Kill background monitors\n    if [ -n \"${IDLE_MONITOR_PID:-}\" ]; then\n        kill \"$IDLE_MONITOR_PID\" 2>/dev/null || true\n    fi\n    echo \"[+] Resource gates released. System offline.\"\n    exit 0\n}\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:578:      "content": "#!/bin/bash\n# OPSEC: Idle state detector for terminal sessions\n# Usage: source idle_monitor.sh <timeout_minutes>\n\nIDLE_TIMEOUT_MIN=${1:-60}  # Default: 5 minutes\nIDLE_FILE=\"/tmp/pixel_terminal_idle_$$\"\nLAST_ACTIVITY_FILE=\"/tmp/pixel_terminal_last_activity_$$\"\n\n# Initialize activity timestamp\ndate +%s > \"$LAST_ACTIVITY_FILE\"\n\n# Update activity on any input\ntrap 'date +%s > \"$LAST_ACTIVITY_FILE\"' DEBUG\n\n# Idle check loop\nidle_monitor_loop() {\n    while true; do\n        sleep 10\n        local last_activity=$(cat \"$LAST_ACTIVITY_FILE\" 2>/dev/null || echo 0)\n        local current_time=$(date +%s)\n        local idle_duration=$((current_time - last_activity))\n\n        if [ \"$idle_duration\" -ge $((IDLE_TIMEOUT_MIN * 60)) ]; then\n            echo \"[!] Idle detected: $IDLE_TIMEOUT_MIN minutes of inactivity\" >&2\n            touch \"$IDLE_FILE\"\n            # Trigger graceful shutdown via master.sh\n            if [ -f \"$HOME/pixel-terminal-master/master.sh\" ]; then\n                bash -c \"source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully\"\n            fi\n            break\n        fi\n    done\n}\n\n# Start the monitor in background\nidle_monitor_loop &\nIDLE_MONITOR_PID=$!\nexport IDLE_MONITOR_PID\n\n# Cleanup on exit\ncleanup_idle_monitor() {\n    kill \"$IDLE_MONITOR_PID\" 2>/dev/null || true\n    rm -f \"$IDLE_FILE\" \"$LAST_ACTIVITY_FILE\"\n}\ntrap cleanup_idle_monitor EXIT\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:669:          "./lib/common.sh:5:    echo \"[!] Initiating graceful shutdown sequence...\"",
+/home/droid/pixel-terminal-master/HANDOVER.json:670:          "./lib/idle_monitor.sh:26:            # Trigger graceful shutdown via master.sh",
+/home/droid/pixel-terminal-master/HANDOVER.json:671:          "./lib/idle_monitor.sh:28:                bash -c \"source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully\"",
+/home/droid/pixel-terminal-master/HANDOVER.json:729:          "./lib/common.sh:5:    echo \"[!] Initiating graceful shutdown sequence...\"",
+/home/droid/pixel-terminal-master/HANDOVER.json:730:          "./lib/idle_monitor.sh:26:            # Trigger graceful shutdown via master.sh",
+/home/droid/pixel-terminal-master/HANDOVER.json:731:          "./lib/idle_monitor.sh:28:                bash -c \"source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully\"",
+/home/droid/pixel-terminal-master/HANDOVER.json:778:      "                bash -c \"source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully\"",
+/home/droid/pixel-terminal-master/HANDOVER.json:780:      "            # Trigger graceful shutdown via master.sh",
+
+--- Searching for: idle ---
+grep: /home/droid/pixel-terminal-master/.git/index: binary file matches
+/home/droid/pixel-terminal-master/.git/logs/refs/heads/main:11:f7b6bf450c1867db2e2545feda4ddc0b60d051fc e129a385bdb0d7272549a7030bcb12248656420f Carter the Duck <carter@duck.ai> 1791067570 +0000    commit: Fix: removed hardcoded kill, disabled idle monitor trap chaining
+/home/droid/pixel-terminal-master/.git/logs/refs/heads/main:12:e129a385bdb0d7272549a7030bcb12248656420f 1387f271e15eaeb1adf5ebd373ffd533480a203b Carter the Duck <carter@duck.ai> 1791081373 +0000    commit: OPSEC: Resolve hardcoded PIDs and restore idle_monitor traps
+/home/droid/pixel-terminal-master/.git/logs/HEAD:11:f7b6bf450c1867db2e2545feda4ddc0b60d051fc e129a385bdb0d7272549a7030bcb12248656420f Carter the Duck <carter@duck.ai> 1791067570 +0000       commit: Fix: removed hardcoded kill, disabled idle monitor trap chaining
+/home/droid/pixel-terminal-master/.git/logs/HEAD:12:e129a385bdb0d7272549a7030bcb12248656420f 1387f271e15eaeb1adf5ebd373ffd533480a203b Carter the Duck <carter@duck.ai> 1791081373 +0000       commit: OPSEC: Resolve hardcoded PIDs and restore idle_monitor traps
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:3:# Usage: source idle_monitor.sh <timeout_minutes>
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:6:IDLE_FILE="/tmp/pixel_terminal_idle_$$"
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:16:idle_monitor_loop() {
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:21:        local idle_duration=$((current_time - last_activity))
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:23:        if [ "$idle_duration" -ge $((IDLE_TIMEOUT_MIN * 60)) ]; then
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:36:idle_monitor_loop &
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:41:cleanup_idle_monitor() {
+/home/droid/pixel-terminal-master/lib/idle_monitor.sh:45:trap cleanup_idle_monitor EXIT
+/home/droid/pixel-terminal-master/HANDOVER.json:30:      "1387f27 | 2026-10-04T02:36:13Z | Carter the Duck | OPSEC: Resolve hardcoded PIDs and restore idle_monitor traps",
+/home/droid/pixel-terminal-master/HANDOVER.json:31:      "e129a38 | 2026-10-03T22:46:10Z | Carter the Duck | Fix: removed hardcoded kill, disabled idle monitor trap chaining",
+/home/droid/pixel-terminal-master/HANDOVER.json:42:      "* main                1387f27 [origin/main] OPSEC: Resolve hardcoded PIDs and restore idle_monitor traps",
+/home/droid/pixel-terminal-master/HANDOVER.json:43:      "  remotes/origin/main 1387f27 OPSEC: Resolve hardcoded PIDs and restore idle_monitor traps"
+/home/droid/pixel-terminal-master/HANDOVER.json:299:        "path": "lib/idle_monitor.sh",
+/home/droid/pixel-terminal-master/HANDOVER.json:464:      "path": "lib/idle_monitor.sh",
+/home/droid/pixel-terminal-master/HANDOVER.json:571:    "lib/idle_monitor.sh": {
+/home/droid/pixel-terminal-master/HANDOVER.json:573:        "path": "lib/idle_monitor.sh",
+/home/droid/pixel-terminal-master/HANDOVER.json:578:      "content": "#!/bin/bash\n# OPSEC: Idle state detector for terminal sessions\n# Usage: source idle_monitor.sh <timeout_minutes>\n\nIDLE_TIMEOUT_MIN=${1:-60}  # Default: 5 minutes\nIDLE_FILE=\"/tmp/pixel_terminal_idle_$$\"\nLAST_ACTIVITY_FILE=\"/tmp/pixel_terminal_last_activity_$$\"\n\n# Initialize activity timestamp\ndate +%s > \"$LAST_ACTIVITY_FILE\"\n\n# Update activity on any input\ntrap 'date +%s > \"$LAST_ACTIVITY_FILE\"' DEBUG\n\n# Idle check loop\nidle_monitor_loop() {\n    while true; do\n        sleep 10\n        local last_activity=$(cat \"$LAST_ACTIVITY_FILE\" 2>/dev/null || echo 0)\n        local current_time=$(date +%s)\n        local idle_duration=$((current_time - last_activity))\n\n        if [ \"$idle_duration\" -ge $((IDLE_TIMEOUT_MIN * 60)) ]; then\n            echo \"[!] Idle detected: $IDLE_TIMEOUT_MIN minutes of inactivity\" >&2\n            touch \"$IDLE_FILE\"\n            # Trigger graceful shutdown via master.sh\n            if [ -f \"$HOME/pixel-terminal-master/master.sh\" ]; then\n                bash -c \"source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully\"\n            fi\n            break\n        fi\n    done\n}\n\n# Start the monitor in background\nidle_monitor_loop &\nIDLE_MONITOR_PID=$!\nexport IDLE_MONITOR_PID\n\n# Cleanup on exit\ncleanup_idle_monitor() {\n    kill \"$IDLE_MONITOR_PID\" 2>/dev/null || true\n    rm -f \"$IDLE_FILE\" \"$LAST_ACTIVITY_FILE\"\n}\ntrap cleanup_idle_monitor EXIT\n"
+/home/droid/pixel-terminal-master/HANDOVER.json:670:          "./lib/idle_monitor.sh:26:            # Trigger graceful shutdown via master.sh",
+/home/droid/pixel-terminal-master/HANDOVER.json:671:          "./lib/idle_monitor.sh:28:                bash -c \"source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully\"",
+/home/droid/pixel-terminal-master/HANDOVER.json:730:          "./lib/idle_monitor.sh:26:            # Trigger graceful shutdown via master.sh",
+/home/droid/pixel-terminal-master/HANDOVER.json:731:          "./lib/idle_monitor.sh:28:                bash -c \"source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully\"",
+/home/droid/pixel-terminal-master/HANDOVER.json:759:    "idle_monitor_processes": [],
+/home/droid/pixel-terminal-master/HANDOVER.json:760:    "idle_monitor_tail_reversed": [
+/home/droid/pixel-terminal-master/HANDOVER.json:761:      "trap cleanup_idle_monitor EXIT",
+/home/droid/pixel-terminal-master/HANDOVER.json:765:      "cleanup_idle_monitor() {",
+/home/droid/pixel-terminal-master/HANDOVER.json:770:      "idle_monitor_loop &",
+/home/droid/pixel-terminal-master/HANDOVER.json:783:      "        if [ \"$idle_duration\" -ge $((IDLE_TIMEOUT_MIN * 60)) ]; then",
+/home/droid/pixel-terminal-master/HANDOVER.json:785:      "        local idle_duration=$((current_time - last_activity))"
+/home/droid/pixel-terminal-master/HANDOVER.json:796:      "lib/idle_monitor.sh contains an active cleanup_idle_monitor EXIT trap",
+/home/droid/pixel-terminal-master/HANDOVER.json:817:    "Run: bash -n ~/pixel-terminal-master/lib/idle_monitor.sh",
+==> Diagnostic complete. Please provide the output for patching.
+
+░▒▓audit_tools on  main 
+❯ cd ~/pixel-terminal-master && cat > ~/fix_pixel_audit.sh <<'EOF'
+∙ #!/usr/bin/env bash
+∙ set -euo pipefail
+∙ cd ~/pixel-terminal-master
+∙ 
+∙ BACKUP="$HOME/pixel-terminal-master.$(date +%Y%m%d_%H%M%S).tgz"
+∙ LOG="$HOME/pixel_diagnostic_$(date +%Y%m%d_%H%M%S).txt"
+∙ 
+∙ echo "Creating backup: $BACKUP"
+∙ tar -czf "$BACKUP" --exclude=.git . 2>/dev/null || true
+∙ 
+∙ {
+∙ echo "=========================================="
+∙ echo "PIXEL TERMINAL DIAGNOSTICS"
+∙ echo "Date: $(date)"
+∙ echo "=========================================="
+∙ echo; echo "--- [1] shutdown_gracefully references ---"
+∙ grep -rn 'shutdown_gracefully' . --include='*.sh' 2>/dev/null || echo "NOT FOUND ANYWHERE"
+∙ 
+∙ echo; echo "--- [2] idle_monitor.sh full contents ---"
+∙ cat lib/idle_monitor.sh 2>/dev/null || echo "FILE MISSING: lib/idle_monitor.sh"
+∙ 
+∙ echo; echo "--- [3] Where idle_monitor is sourced ---"
+∙ grep -rn 'source.*idle_monitor\|\. .*idle_monitor' . --include='*.sh' 2>/dev/null || echo "NOT SOURCED ANYWHERE"
+∙ 
+∙ echo; echo "--- [4] PID-based idle file ($$) ---"
+∙ grep -rn 'pixel_terminal_idle_\$\$\|/tmp/pixel.*idle' . --include='*.sh' 2>/dev/null || echo "NOT FOUND"
+∙ 
+∙ echo; echo "--- [5] EXIT traps in sourced files ---"
+∙ grep -rn 'trap.*EXIT' lib/ addons/ . --include='*.sh' 2>/dev/null | head -20 || echo "NONE FOUND"
+∙ 
+∙ echo; echo "--- [6] Mangled escapes (\\\$ and \\\\_) ---"
+∙ grep -rn '\\\$\\|\\\\_' addons/3_resource_gate.sh lib/ --include='*.sh' 2>/dev/null | head -20 || echo "CLEAN"
+∙ 
+∙ echo; echo "--- [7] 3_resource_gate.sh lines 40-65 ---"
+∙ nl -ba addons/3_resource_gate.sh 2>/dev/null | sed -n '40,65p' || echo "FILE MISSING"
+∙ 
+∙ echo; echo "--- [8] timeout_wrapper.sh contents ---"
+∙ cat lib/timeout_wrapper.sh 2>/dev/null || echo "FILE MISSING"
+∙ 
+∙ echo; echo "--- [9] Battery gate check ---"
+∙ nl -ba install_addons.sh 2>/dev/null | sed -n '43,69p' || echo "SECTION MISSING"
+∙ 
+∙ } | tee "$LOG"
+∙ echo; echo "Full log: $LOG"
+∙ EOF
+
+░▒▓pixel-terminal-master on  main 
+❯ chmod +x ~/fix_pixel_audit.sh
+
+░▒▓pixel-terminal-master on  main 
+❯ ~/fix_pixel_audit.sh
+Creating backup: /home/droid/pixel-terminal-master.20261010_003632.tgz
+==========================================
+PIXEL TERMINAL DIAGNOSTICS
+Date: Sat Oct 10 00:36:32 UTC 2026
+==========================================
+
+--- [1] shutdown_gracefully references ---
+./lib/common.sh:4:shutdown_gracefully() {
+./lib/idle_monitor.sh:28:                bash -c "source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully"
+
+--- [2] idle_monitor.sh full contents ---
+#!/bin/bash
+# OPSEC: Idle state detector for terminal sessions
+# Usage: source idle_monitor.sh <timeout_minutes>
+
+IDLE_TIMEOUT_MIN=${1:-60}  # Default: 5 minutes
+IDLE_FILE="/tmp/pixel_terminal_idle_$$"
+LAST_ACTIVITY_FILE="/tmp/pixel_terminal_last_activity_$$"
+
+# Initialize activity timestamp
+date +%s > "$LAST_ACTIVITY_FILE"
+
+# Update activity on any input
+trap 'date +%s > "$LAST_ACTIVITY_FILE"' DEBUG
+
+# Idle check loop
+idle_monitor_loop() {
+    while true; do
+        sleep 10
+        local last_activity=$(cat "$LAST_ACTIVITY_FILE" 2>/dev/null || echo 0)
+        local current_time=$(date +%s)
+        local idle_duration=$((current_time - last_activity))
+
+        if [ "$idle_duration" -ge $((IDLE_TIMEOUT_MIN * 60)) ]; then
+            echo "[!] Idle detected: $IDLE_TIMEOUT_MIN minutes of inactivity" >&2
+            touch "$IDLE_FILE"
+            # Trigger graceful shutdown via master.sh
+            if [ -f "$HOME/pixel-terminal-master/master.sh" ]; then
+                bash -c "source $HOME/pixel-terminal-master/lib/common.sh; shutdown_gracefully"
+            fi
+            break
+        fi
+    done
+}
+
+# Start the monitor in background
+idle_monitor_loop &
+IDLE_MONITOR_PID=$!
+export IDLE_MONITOR_PID
+
+# Cleanup on exit
+cleanup_idle_monitor() {
+    kill "$IDLE_MONITOR_PID" 2>/dev/null || true
+    rm -f "$IDLE_FILE" "$LAST_ACTIVITY_FILE"
+}
+trap cleanup_idle_monitor EXIT
+
+--- [3] Where idle_monitor is sourced ---
+./lib/idle_monitor.sh:3:# Usage: source idle_monitor.sh <timeout_minutes>
+
+--- [4] PID-based idle file (1776) ---
+./lib/idle_monitor.sh:6:IDLE_FILE="/tmp/pixel_terminal_idle_$$"
+
+--- [5] EXIT traps in sourced files ---
+lib/idle_monitor.sh:45:trap cleanup_idle_monitor EXIT
+./Vid2gif/vid2gif.sh:229:    trap temp_cleanup EXIT
+./lib/idle_monitor.sh:45:trap cleanup_idle_monitor EXIT
+
+--- [6] Mangled escapes (\$ and \\_) ---
+CLEAN
+
+--- [7] 3_resource_gate.sh lines 40-65 ---
+
+--- [8] timeout_wrapper.sh contents ---
+#!/bin/bash
+# Usage: timeout_wrapper.sh <seconds> <command>
+TIMEOUT=$1
+shift
+CMD="$@"
+if ! command -v timeout &> /dev/null; then
+    echo "[-] Error: 'timeout' utility not found."
+    exit 1
+fi
+timeout "$TIMEOUT" bash -c "$CMD"
+
+--- [9] Battery gate check ---
+    43  # /sys/class/power_supply on plain Linux; skips the gate (exit 0, don't
+    44  # block the pipeline) if no battery source can be found at all, since an
+    45  # AVF VM may have no exposed battery telemetry.
+    46  cat << 'EOF' > addons/3_resource_gate.sh
+    47  #!/usr/bin/env bash
+    48  set -e
+    49  MIN_BATTERY="${1:-20}"
+    50
+    51  get_battery_pct() {
+    52      if command -v termux-battery-status >/dev/null 2>&1; then
+    53          termux-battery-status | grep -oP '(?<="percentage": )\d+'
+    54          return
+    55      fi
+    56      for supply in /sys/class/power_supply/*/capacity; do
+    57          [ -f "$supply" ] && cat "$supply" && return
+    58      done
+    59      echo ""
+    60  }
+    61
+    62  battery_pct=$(get_battery_pct)
+    63
+    64  if [ -z "$battery_pct" ]; then
+    65      echo "warn: no battery source found, skipping gate" >&2
+    66      exit 0
+    67  fi
+    68
+    69  [ "$battery_pct" -lt "$MIN_BATTERY" ] && exit 1 || exit 0
+
+Full log: /home/droid/pixel_diagnostic_20261010_003632.txt
+
+░▒▓pixel-terminal-master on  main 
+❯ #!/bin/bash
+
+░▒▓pixel-terminal-master on  main 
+❯ # Carter's Diagnostic Suite
+
+░▒▓pixel-terminal-master on  main 
+❯ cat << 'EOF' > ~/session_diag.sh
+∙ #!/bin/bash
+∙ echo "--- [ SYSTEM ] ---"
+∙ uname -a
+∙ cat /etc/os-release | grep PRETTY_NAME
+∙ echo "--- [ RUNTIMES ] ---"
+∙ bash --version | head -n1
+∙ python3 --version
+∙ echo "--- [ REPOSITORY ] ---"
+∙ cd ~/pixel-terminal-master || exit 1
+∙ git status
+∙ git remote -v
+∙ git branch -a
+∙ echo "--- [ CODE AUDIT ] ---"
+∙ grep -rn "kill -9" .
+∙ find . -maxdepth 3 -name "*.sh"
+∙ echo "--- [ PROCESSES ] ---"
+∙ ps aux | grep -E 'idle_monitor|pixel' | grep -v grep
+∙ EOF
+
+░▒▓pixel-terminal-master on  main 
+❯ chmod +x ~/session_diag.sh
+
+░▒▓pixel-terminal-master on  main 
+❯ ~/session_diag.sh
+--- [ SYSTEM ] ---
+Linux debian 6.12.92-android16-6-g4e585dd7f3b7-ab16266940-4k #1 SMP PREEMPT Fri Sep  4 16:39:13 UTC 2026 aarch64 GNU/Linux
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+--- [ RUNTIMES ] ---
+GNU bash, version 5.2.37(1)-release (aarch64-unknown-linux-gnu)
+Python 3.13.5
+--- [ REPOSITORY ] ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+origin  git@github.com:bilbywilby/pixel-terminal-master.git (fetch)
+origin  git@github.com:bilbywilby/pixel-terminal-master.git (push)
+* main
+  remotes/origin/main
+--- [ CODE AUDIT ] ---
+./HANDOVER.json:601:      "kill -9 [0-9]": {
+./HANDOVER.json:755:      "command": "grep -RInE 'kill -9 [0-9]+' --exclude-dir=.git .",
+./HANDOVER.json:797:      "No hardcoded numeric PID matched the audited kill -9 pattern",
+./Vid2gif/fix_repo.sh
+./Vid2gif/vid2gif.sh
+./install_addons.sh
+./master.sh
+./install.sh
+./lib/monitor.sh
+./lib/dto.sh
+./lib/termux_api.sh
+./lib/adb.sh
+./lib/common.sh
+./lib/timeout_wrapper.sh
+./lib/crypto.sh
+./lib/plugin.sh
+./lib/idle_monitor.sh
+./lib/config.sh
+./lib/scheduler.sh
+./addons/2_scheduler.sh
+./addons/5_dep_injector.sh
+./addons/6_telemetry.sh
+./addons/8_log_rotator.sh
+./addons/10_wg_rotator.sh
+./addons/4_archiver.sh
+./addons/9_network_presence.sh
+./addons/3_resource_gate.sh
+./fix_git_sync.sh
+--- [ PROCESSES ] ---
+
+░▒▓pixel-terminal-master on  main 
+❯ cat << 'EOF' > ~/opsec_audit.py
+∙ #!/usr/bin/env python3
+∙ import os
+∙ import subprocess
+∙ import sys
+∙ 
+∙ def run_cmd(cmd):
+∙     try:
+∙         return subprocess.check_output(cmd, shell=True, text=True).strip()
+∙     except subprocess.CalledProcessError as e:
+∙         return f"Error: {e.output}"
+∙ 
+∙ def main():
+∙     # Atomic directory initialization
+∙     log_dir = os.path.expanduser("~/opsec_audit_logs")
+∙     if not os.path.exists(log_dir):
+∙         os.makedirs(log_dir)
+∙         print(f"[+] Created {log_dir}")
+∙ 
+∙     # Git State Capture
+∙     repo_path = os.path.expanduser("~/pixel-terminal-master")
+∙     commit_hash = run_cmd(f"git -C {repo_path} rev-parse HEAD")
+∙     
+∙     # Tac-based Reverse Audit (Captures latest changes first)
+∙     audit_file = os.path.join(repo_path, "lib/monitor.sh")
+∙     if os.path.exists(audit_file):
+∙         # Using tac to read the file in reverse to identify tail-end injections
+∙         reversed_content = run_cmd(f"tac {audit_file}")
+∙         
+∙         with open(os.path.join(log_dir, "monitor_reverse.log"), "w") as f:
+∙             f.write(f"Commit: {commit_hash}\n")
+∙             f.write("-" * 40 + "\n")
+∙             f.write(reversed_content)
+∙         print(f"[+] Reverse audit written to {log_dir}/monitor_reverse.log")
+∙ 
+∙     print(f"[✓] OPSEC Audit Complete. Hash: {commit_hash}")
+∙ 
+∙ if __name__ == "__main__":
+∙     main()
+∙ EOF
+
+░▒▓pixel-terminal-master on  main 
+❯ chmod +x ~/opsec_audit.py
+
+░▒▓pixel-terminal-master on  main 
+❯ python3 ~/opsec_audit.py
+[+] Created /home/droid/opsec_audit_logs
+[+] Reverse audit written to /home/droid/opsec_audit_logs/monitor_reverse.log
+[✓] OPSEC Audit Complete. Hash: fdf8526223acce23150a0eea4d30efb50c505817
+
+░▒▓pixel-terminal-master on  main 
+❯ # Terminal usage (no wrapper needed)
+
+░▒▓pixel-terminal-master on  main 
+❯ PYTHONPATH="$PWD/src" python3 src/audit_manifest.py path/to/AndroidManifest.xml
+python3: can't open file '/home/droid/pixel-terminal-master/src/audit_manifest.py': [Errno 2] No such file or directory
+
+░▒▓pixel-terminal-master on  main 
+❯ 
+
+░▒▓pixel-terminal-master on  main 
+❯ # With output file
+
+░▒▓pixel-terminal-master on  main 
+❯ PYTHONPATH="$PWD/src" python3 src/audit_manifest.py app.xml --out report.txt
+python3: can't open file '/home/droid/pixel-terminal-master/src/audit_manifest.py': [Errno 2] No such file or directory
+
+░▒▓pixel-terminal-master on  main 
+❯ 
+
+░▒▓pixel-terminal-master on  main 
+❯ # HTML report for w3m
+
+░▒▓pixel-terminal-master on  main 
+❯ PYTHONPATH="$PWD/src" python3 src/audit_manifest.py app.xml --html --out report.html
+python3: can't open file '/home/droid/pixel-terminal-master/src/audit_manifest.py': [Errno 2] No such file or directory
+
+░▒▓pixel-terminal-master on  main 
+❯ w3m -T text/html -dump report.html
+w3m: Can't load report.html.
+
+░▒▓pixel-terminal-master on  main 
+❯ 
+
+░▒▓pixel-terminal-master on  main 
+❯ # JSON for scripting
+
+░▒▓pixel-terminal-master on  main 
+❯ PYTHONPATH="$PWD/src" python3 src/audit_manifest.py app.xml --json
+python3: can't open file '/home/droid/pixel-terminal-master/src/audit_manifest.py': [Errno 2] No such file or directory
+
+░▒▓pixel-terminal-master on  main 
+❯ 
+
+░▒▓pixel-terminal-master on  main 
+❯ # Wrapper script (convenient)
+
+░▒▓pixel-terminal-master on  main 
+❯ bin/audit_manifest path/to/AndroidManifest.xml
+bash: bin/audit_manifest: No such file or directory
+
+░▒▓pixel-terminal-master on  main 
+❯ 
+
+░▒▓pixel-terminal-master on  main 
+❯ # Run tests
+
+░▒▓pixel-terminal-master on  main 
+❯ python3 -m pytest tests/ -v
+========================= test session starts =========================
+platform linux -- Python 3.13.5, pytest-8.3.5, pluggy-1.5.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/droid
+configfile: pyproject.toml
+plugins: anyio-4.15.1
+collected 0 items                                                     
+
+======================== no tests ran in 0.01s ========================
+ERROR: file or directory not found: tests/
+
+
+░▒▓pixel-terminal-master on  main 
+❯ ls -la
+total 252
+drwxr-xr-x  9 droid users  4096 Oct  4 02:46  .
+drwx------ 37 droid users  4096 Oct 10 00:36  ..
+drwxr-xr-x  8 droid users  4096 Oct 10 00:36  .git
+-rw-r--r--  1 droid users   232 Aug  8 14:14  .gitignore
+drwxr-xr-x  2 droid users  4096 Oct  4 02:46  .handover-backups
+-rw-r--r--  1 droid users     0 Oct  3 17:39  .heartbeat
+-rw-r--r--  1 droid users 11247 Oct  3 21:16 '; do'
+-rw-------  1 droid users 59873 Oct  4 02:46  HANDOVER.json
+-rw-r--r--  1 droid users  1067 Aug  8 17:42  LICENSE
+-rw-r--r--  1 droid users  9574 Aug  8 17:42  README.md
+-rw-r--r--  1 droid users 11247 Oct  3 21:16 'T_MOD="$CURRENT_MOD"'
+-rw-r--r--  1 droid users     0 Oct  3 21:16 'T_MOD=$(stat -c %Y "$TARGET")'
+drwxr-xr-x  3 droid users  4096 Oct  4 02:46  Vid2gif
+drwxr-xr-x  2 droid users  4096 Oct  4 02:46  __pycache__
+drwxr-xr-x  3 droid users  4096 Oct  3 22:46  addons
+-rw-r--r--  1 droid users   825 Oct  3 18:04  app.log
+drwxr-xr-x  2 droid users  4096 Oct  3 16:22  bin
+-rw-r--r--  1 droid users  4393 Aug  8 11:40  dashboard.py
+-rw-r--r--  1 droid users 11247 Oct  3 21:16 'entinel Active. Monitoring $TARGET..."'
+-rw-r--r--  1 droid users 11247 Oct  3 21:16 'entinel Start: $(date) ---" > "$LOG"'
+-rw-r--r--  1 droid users 11247 Oct  3 21:16 'entinel resuming..." | tee -a "$LOG"'
+-rwxr-xr-x  1 droid users   621 Aug  8 17:42  fix_git_sync.sh
+-rw-r--r--  1 droid users  4803 Aug  8 14:50  git_push_main.py
+-rwxr-xr-x  1 droid users 10598 Aug  8 11:00  install.sh
+-rw-r--r--  1 droid users  4347 Aug  8 18:57  install_addons.sh
+drwxr-xr-x  2 droid users  4096 Oct  3 22:46  lib
+-rwxr-xr-x  1 droid users  6379 Oct  3 16:54  master.sh
+-rwxr-xr-x  1 droid users  6379 Oct  3 16:54  master.sh.bak
+-rw-------  1 droid users     0 Oct  3 22:58  nohup.out
+-rw-r--r--  1 droid users  4357 Aug  8 18:20  project.json
+-rw-r--r--  1 droid users  2451 Aug  8 15:35  state.py
+-rw-r--r--  1 droid users   695 Aug  8 14:13  system_architect.md
+
+░▒▓pixel-terminal-master on  main 
+❯ 
